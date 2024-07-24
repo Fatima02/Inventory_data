@@ -1,0 +1,146 @@
+pip install spapi
+!pip install python-amazon-sp-api
+!pip install "python-amazon-sp-api[aws]" # if you want to use AWS Secret Manager Authentication.
+!pip install "python-amazon-sp-api[aws-caching]" # if you want to use the Cached Secrets from AWS
+
+CLIENT_CONFIG = {
+  "lwa_app_id": "amzn1.application-***********************",
+  "lwa_client_secret": "amzn1.oa2-cs.v1.***********************",
+  "aws_access_key": "A***********************",  # Your AWS Access Key ID
+  "aws_secret_key": "LrwFA/7eL***********************",  # Your AWS Secret Access Key
+  "role_arn": "arn:aws:iam::***********************:role/SP-API-Role",
+  "refresh_token": "Atzr|IwEBIDJxAT***********************",
+}
+
+import csv
+import json
+import time
+import requests
+import gspread
+from sp_api.api import Reports
+from sp_api.base import Marketplaces, ReportType, ProcessingStatus
+from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
+import os
+os.environ['ENV_DISABLE_DONATION_MSG'] = '1'
+# Assuming CLIENT_CONFIG is already defined with your credentials
+
+# Google Sheets setup
+SCOPE = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+CREDS = ServiceAccountCredentials.from_json_keyfile_name('/content/inventory-data-Key.json', SCOPE)
+CLIENT = gspread.authorize(CREDS)
+SHEET_NAME = 'Inventory-Data'  # Replace with your Google Sheet name
+
+
+if __name__ == '__main__':
+    report_type = ReportType.GET_FBA_MYI_ALL_INVENTORY_DATA
+    reports_api = Reports(credentials=CLIENT_CONFIG, marketplace=Marketplaces.AE)
+
+    # Create the report
+    create_report_response = reports_api.create_report(reportType=report_type)
+    report = create_report_response.payload
+    print("Report created:", report)
+    report_id = report['reportId']
+
+    # Get the report status
+    report_status_response = reports_api.get_report(report_id)
+    report_status = report_status_response.payload
+
+    # Polling until the report is done or fails
+    while report_status['processingStatus'] not in [ProcessingStatus.DONE, ProcessingStatus.FATAL, ProcessingStatus.CANCELLED]:
+        print("Current status:", report_status)
+        print('Sleeping...')
+        time.sleep(30)  # Increase sleep time to reduce API throttling risk
+        report_status_response = reports_api.get_report(report_id)
+        report_status = report_status_response.payload
+
+    if report_status['processingStatus'] in [ProcessingStatus.FATAL, ProcessingStatus.CANCELLED]:
+        print("Report failed!")
+        print("Error details:", report_status)
+    else:
+        print("Report completed successfully!")
+        print(report_status)
+
+        # Get the report document
+        report_document_response = reports_api.get_report_document(report_status['reportDocumentId'])
+        report_document = report_document_response.payload
+        print("Report document:", report_document)
+
+        # Fetch the report data from the URL
+        report_url = report_document.get('url')
+        response = requests.get(report_url)
+        decoded_content = response.content.decode('cp1252')
+        reader = csv.DictReader(decoded_content.splitlines(), delimiter='\t')
+
+        data_list = []
+        for row in reader:
+            data = {
+                'sku': row['sku'],
+                'fnsku': row['fnsku'],
+                'asin': row['asin'],
+                'product_name': row['product-name'],
+                'condition': row['condition'],
+                'your_price': int(float(row['your-price'] or '0') * 100),
+                'mfn_listing_exists': row['mfn-listing-exists'] == 'Yes',
+                'mfn_fulfillable_quantity': row['mfn-fulfillable-quantity'] or None,
+                'afn_listing_exists': row['afn-listing-exists'] == 'Yes',
+                'afn_warehouse_quantity': row['afn-warehouse-quantity'],
+                'afn_fulfillable_quantity': row['afn-fulfillable-quantity'],
+                'afn_unsellable_quantity': row['afn-unsellable-quantity'],
+                'afn_reserved_quantity': row['afn-reserved-quantity'],
+                'afn_total_quantity': row['afn-total-quantity'],
+                'afn_inbound_working_quantity': row['afn-inbound-working-quantity'],
+                'afn_inbound_shipped_quantity': row['afn-inbound-shipped-quantity'],
+                'afn_inbound_receiving_quantity': row['afn-inbound-receiving-quantity'],
+                'afn_researching_quantity': row['afn-researching-quantity'],
+                'afn_reserved_future_supply': row['afn-reserved-future-supply'],
+                'afn_future_supply_buyable': row['afn-future-supply-buyable'],
+                'per_unit_volume': float(row['per-unit-volume']) if row['per-unit-volume'] else None,
+                'date': datetime.now().strftime('%Y-%m-%d')
+            }
+            data_list.append(data)
+
+        print("Data extracted from report:", data_list)
+
+        # Open the Google Sheet
+        sheet = CLIENT.open(SHEET_NAME).sheet1
+
+        # Read existing data to get previous day's inventory
+        existing_data = sheet.get_all_records()
+        previous_day_inventory = {}
+        if existing_data:
+            date_field_exists = 'date' in existing_data[0]
+            if date_field_exists:
+                for record in existing_data:
+                    sku = record['sku']
+                    date = record['date']
+                    if date == (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d'):
+                        previous_day_inventory[sku] = record
+
+        # Clear the existing data
+        sheet.clear()
+
+        # Write header
+        header = [
+            'sku', 'fnsku', 'asin', 'product_name', 'condition', 'your_price', 'mfn_listing_exists',
+            'mfn_fulfillable_quantity', 'afn_listing_exists', 'afn_warehouse_quantity', 'afn_fulfillable_quantity',
+            'afn_unsellable_quantity', 'afn_reserved_quantity', 'afn_total_quantity', 'afn_inbound_working_quantity',
+            'afn_inbound_shipped_quantity', 'afn_inbound_receiving_quantity', 'afn_researching_quantity',
+            'afn_reserved_future_supply', 'afn_future_supply_buyable', 'per_unit_volume', 'date', 'sold_since_yesterday'
+        ]
+        sheet.append_row(header)
+
+        # Write data
+        for data in data_list:
+            previous_day_quantity = previous_day_inventory.get(data['sku'], {}).get('afn_total_quantity', 0)
+            sold_since_yesterday = int(previous_day_quantity) - int(data['afn_total_quantity']) if previous_day_quantity else None
+            row = [
+                data['sku'], data['fnsku'], data['asin'], data['product_name'], data['condition'], data['your_price'],
+                data['mfn_listing_exists'], data['mfn_fulfillable_quantity'], data['afn_listing_exists'],
+                data['afn_warehouse_quantity'], data['afn_fulfillable_quantity'], data['afn_unsellable_quantity'],
+                data['afn_reserved_quantity'], data['afn_total_quantity'], data['afn_inbound_working_quantity'],
+                data['afn_inbound_shipped_quantity'], data['afn_inbound_receiving_quantity'], data['afn_researching_quantity'],
+                data['afn_reserved_future_supply'], data['afn_future_supply_buyable'], data['per_unit_volume'], data['date'], sold_since_yesterday
+            ]
+            sheet.append_row(row)
+
